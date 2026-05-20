@@ -112,11 +112,7 @@ impl LsColors {
     fn style_for_suffix(&self, name: &str) -> Option<&str> {
         let mut found = None;
         for (suffix, style) in &self.suffixes {
-            if name.ends_with(suffix)
-                || name
-                    .to_ascii_lowercase()
-                    .ends_with(&suffix.to_ascii_lowercase())
-            {
+            if ends_with_ignore_ascii_case(name, suffix) {
                 found = Some(style.as_str());
             }
         }
@@ -170,6 +166,12 @@ impl LsColors {
             text
         }
     }
+}
+
+fn ends_with_ignore_ascii_case(name: &str, suffix: &str) -> bool {
+    name.as_bytes()
+        .get(name.len().saturating_sub(suffix.len())..)
+        .is_some_and(|end| end.eq_ignore_ascii_case(suffix.as_bytes()))
 }
 
 fn indicator_for(
@@ -503,8 +505,7 @@ fn scan_tokens(command: &str) -> Vec<String> {
             }
             ' ' | '\t' | '\n' | '\r' | ';' | '|' | '&' => {
                 if !current.is_empty() {
-                    tokens.push(current.clone());
-                    current.clear();
+                    tokens.push(std::mem::take(&mut current));
                 }
                 if (ch == '&' || ch == '|') && chars.peek() == Some(&ch) {
                     chars.next();
@@ -855,6 +856,10 @@ mod tests {
         assert_eq!(
             colors.colorize("file.txt", &file, false),
             "\x1b[32mfile.txt\x1b[0m"
+        );
+        assert_eq!(
+            colors.colorize("FILE.TXT", &file, false),
+            "\x1b[32mFILE.TXT\x1b[0m"
         );
     }
 
