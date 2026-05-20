@@ -25,6 +25,9 @@ enum Indicator {
     Socket,
     Block,
     Char,
+    Sticky,
+    OtherWritable,
+    StickyOtherWritable,
     Orphan,
     Executable,
     Missing,
@@ -41,6 +44,9 @@ impl Indicator {
             "so" => Some(Self::Socket),
             "bd" => Some(Self::Block),
             "cd" => Some(Self::Char),
+            "st" => Some(Self::Sticky),
+            "ow" => Some(Self::OtherWritable),
+            "tw" => Some(Self::StickyOtherWritable),
             "or" => Some(Self::Orphan),
             "ex" => Some(Self::Executable),
             "mi" => Some(Self::Missing),
@@ -77,13 +83,15 @@ impl LsColors {
                 if style.is_empty() || style == "0" || style == "00" {
                     self.suffixes.retain(|(existing, _)| existing != suffix);
                 } else {
-                    self.suffixes.push((suffix.to_string(), style.to_string()));
+                    self.suffixes
+                        .push((suffix.to_string(), normalize_ls_color_style(style)));
                 }
             } else if let Some(indicator) = Indicator::from_key(key) {
                 if style.is_empty() || style == "0" || style == "00" {
                     self.indicators.remove(&indicator);
                 } else {
-                    self.indicators.insert(indicator, style.to_string());
+                    self.indicators
+                        .insert(indicator, normalize_ls_color_style(style));
                 }
             }
         }
@@ -125,6 +133,9 @@ impl LsColors {
             .or_else(|| {
                 let fallback = match indicator {
                     Indicator::Executable => Indicator::Regular,
+                    Indicator::Sticky
+                    | Indicator::OtherWritable
+                    | Indicator::StickyOtherWritable => Indicator::Directory,
                     Indicator::Orphan | Indicator::Missing => Indicator::Symlink,
                     _ => indicator,
                 };
@@ -158,14 +169,301 @@ impl LsColors {
         metadata: Option<&fs::Metadata>,
         symlink_target_exists: Option<bool>,
     ) -> String {
-        let text = display_with_dir_marker(display, is_dir);
+        if metadata.is_some() {
+            if let Some(output) = self.colorize_components(
+                display,
+                classify_path,
+                is_dir,
+                metadata,
+                symlink_target_exists,
+            ) {
+                return output;
+            }
+        }
+        self.colorize_whole_with_metadata(
+            display,
+            classify_path,
+            is_dir,
+            metadata,
+            symlink_target_exists,
+        )
+    }
+
+    fn colorize_whole_with_metadata(
+        &self,
+        display: &str,
+        classify_path: &Path,
+        is_dir: bool,
+        metadata: Option<&fs::Metadata>,
+        symlink_target_exists: Option<bool>,
+    ) -> String {
+        let marker = if is_dir && display != "/" && !display.ends_with('/') {
+            "/"
+        } else {
+            ""
+        };
         if let Some(style) = self.style_for_metadata(classify_path, metadata, symlink_target_exists)
         {
-            format!("\x1b[{style}m{text}\x1b[0m")
+            format!("\x1b[{style}m{display}\x1b[0m{marker}")
         } else {
-            text
+            format!("{display}{marker}")
         }
     }
+
+    fn colorize_components(
+        &self,
+        display: &str,
+        classify_path: &Path,
+        is_dir: bool,
+        metadata: Option<&fs::Metadata>,
+        symlink_target_exists: Option<bool>,
+    ) -> Option<String> {
+        let components = display_components(display);
+        if components.is_empty() {
+            return None;
+        }
+        let marker = if is_dir && display != "/" && !display.ends_with('/') {
+            "/"
+        } else {
+            ""
+        };
+        let mut current = component_base_path(display, classify_path, &components);
+        let mut output = String::new();
+        let last_component = components.len() - 1;
+
+        for (index, component) in components.into_iter().enumerate() {
+            match &component.path_part {
+                ComponentPart::Root => current = PathBuf::from("/"),
+                ComponentPart::Base => {}
+                ComponentPart::Normal(name) => current.push(name),
+            }
+            if index == last_component {
+                append_styled_component(
+                    &mut output,
+                    &component.text,
+                    self.style_for_metadata(classify_path, metadata, symlink_target_exists),
+                );
+            } else {
+                let component_metadata = current.symlink_metadata().ok();
+                let component_symlink_target_exists = component_metadata
+                    .as_ref()
+                    .filter(|m| m.file_type().is_symlink())
+                    .map(|_| fs::metadata(&current).is_ok());
+                append_styled_component(
+                    &mut output,
+                    &component.text,
+                    self.style_for_metadata(
+                        &current,
+                        component_metadata.as_ref(),
+                        component_symlink_target_exists,
+                    ),
+                );
+            }
+        }
+
+        output.push_str(marker);
+        Some(output)
+    }
+}
+
+fn normalize_ls_color_style(style: &str) -> String {
+    let parts: Vec<_> = style.split(';').collect();
+    let mut leading = Vec::new();
+    let mut attrs = [false; 10];
+    let mut foreground = None;
+    let mut background = None;
+    let mut index = 0;
+
+    while index < parts.len() {
+        let Some(code) = parse_sgr_code(parts[index]) else {
+            leading.push(parts[index].to_string());
+            index += 1;
+            continue;
+        };
+
+        match code {
+            0 => attrs = [false; 10],
+            1..=5 | 7..=9 => attrs[code as usize] = true,
+            6 => attrs[5] = true,
+            30..=37 | 90..=97 => foreground = Some(vec![code.to_string()]),
+            38 => {
+                if let Some((color, consumed)) = parse_extended_color(&parts, index) {
+                    foreground = Some(color);
+                    index += consumed - 1;
+                } else {
+                    leading.push(code.to_string());
+                }
+            }
+            40..=47 | 100..=107 => background = Some(vec![code.to_string()]),
+            48 => {
+                if let Some((color, consumed)) = parse_extended_color(&parts, index) {
+                    background = Some(color);
+                    index += consumed - 1;
+                } else {
+                    leading.push(code.to_string());
+                }
+            }
+            _ => leading.push(code.to_string()),
+        }
+        index += 1;
+    }
+
+    let mut normalized = Vec::new();
+    for attr in [1, 2, 3, 4, 5, 7, 8, 9] {
+        if attrs[attr] {
+            normalized.push(attr.to_string());
+        }
+    }
+    normalized.extend(leading);
+    if let Some(background) = background {
+        normalized.extend(background);
+    }
+    if let Some(foreground) = foreground {
+        normalized.extend(foreground);
+    }
+    normalized.join(";")
+}
+
+fn parse_sgr_code(code: &str) -> Option<u16> {
+    code.parse().ok()
+}
+
+fn parse_extended_color(parts: &[&str], index: usize) -> Option<(Vec<String>, usize)> {
+    let code = parse_sgr_code(parts[index])?;
+    let mode = parse_sgr_code(parts.get(index + 1)?)?;
+    match mode {
+        5 => {
+            let color = parse_sgr_code(parts.get(index + 2)?)?;
+            Some((
+                vec![code.to_string(), mode.to_string(), color.to_string()],
+                3,
+            ))
+        }
+        2 => {
+            let red = parse_sgr_code(parts.get(index + 2)?)?;
+            let green = parse_sgr_code(parts.get(index + 3)?)?;
+            let blue = parse_sgr_code(parts.get(index + 4)?)?;
+            Some((
+                vec![
+                    code.to_string(),
+                    mode.to_string(),
+                    red.to_string(),
+                    green.to_string(),
+                    blue.to_string(),
+                ],
+                5,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ComponentPart {
+    Root,
+    Base,
+    Normal(String),
+}
+
+#[derive(Clone, Debug)]
+struct DisplayComponent {
+    text: String,
+    path_part: ComponentPart,
+}
+
+fn append_styled_component(output: &mut String, text: &str, style: Option<&str>) {
+    if let Some(style) = style {
+        output.push_str(&format!("\x1b[{style}m{text}\x1b[0m"));
+    } else {
+        output.push_str(text);
+    }
+}
+
+fn display_components(display: &str) -> Vec<DisplayComponent> {
+    if display == "~" {
+        return vec![DisplayComponent {
+            text: "~".to_string(),
+            path_part: ComponentPart::Base,
+        }];
+    }
+    if let Some(rest) = display.strip_prefix("~/") {
+        let mut components = vec![DisplayComponent {
+            text: "~/".to_string(),
+            path_part: ComponentPart::Base,
+        }];
+        components.extend(normal_display_components(rest));
+        return components;
+    }
+    let mut components = Vec::new();
+    let normal_start = Path::new(display).is_absolute();
+    for component in Path::new(display).components() {
+        match component {
+            Component::RootDir => components.push(DisplayComponent {
+                text: "/".to_string(),
+                path_part: ComponentPart::Root,
+            }),
+            Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                components.push(DisplayComponent {
+                    text: component.as_os_str().to_string_lossy().into_owned(),
+                    path_part: ComponentPart::Normal(
+                        component.as_os_str().to_string_lossy().into_owned(),
+                    ),
+                });
+            }
+            Component::Prefix(_) => return Vec::new(),
+        }
+    }
+    add_intermediate_separators(&mut components, normal_start);
+    components
+}
+
+fn normal_display_components(display: &str) -> Vec<DisplayComponent> {
+    let mut components = Vec::new();
+    for component in Path::new(display).components() {
+        match component {
+            Component::Normal(_) | Component::CurDir | Component::ParentDir => {
+                components.push(DisplayComponent {
+                    text: component.as_os_str().to_string_lossy().into_owned(),
+                    path_part: ComponentPart::Normal(
+                        component.as_os_str().to_string_lossy().into_owned(),
+                    ),
+                });
+            }
+            _ => return Vec::new(),
+        }
+    }
+    add_intermediate_separators(&mut components, false);
+    components
+}
+
+fn add_intermediate_separators(components: &mut [DisplayComponent], skip_first: bool) {
+    if components.len() < 2 {
+        return;
+    }
+    let last = components.len() - 1;
+    for (index, component) in components.iter_mut().enumerate() {
+        if index != last && !(skip_first && index == 0) {
+            component.text.push('/');
+        }
+    }
+}
+
+fn component_base_path(
+    display: &str,
+    classify_path: &Path,
+    components: &[DisplayComponent],
+) -> PathBuf {
+    if Path::new(display).is_absolute() {
+        return PathBuf::new();
+    }
+    let mut base = classify_path.to_path_buf();
+    for _ in components
+        .iter()
+        .filter(|component| matches!(component.path_part, ComponentPart::Normal(_)))
+    {
+        base.pop();
+    }
+    base
 }
 
 fn ends_with_ignore_ascii_case(name: &str, suffix: &str) -> bool {
@@ -183,6 +481,20 @@ fn indicator_for(
     };
     let file_type = metadata.file_type();
     if file_type.is_dir() {
+        #[cfg(unix)]
+        {
+            let is_sticky = metadata.mode() & 0o1000 != 0;
+            let is_other_writable = metadata.mode() & 0o002 != 0;
+            if is_sticky && is_other_writable {
+                return Indicator::StickyOtherWritable;
+            }
+            if is_other_writable {
+                return Indicator::OtherWritable;
+            }
+            if is_sticky {
+                return Indicator::Sticky;
+            }
+        }
         Indicator::Directory
     } else if file_type.is_symlink() {
         if symlink_target_exists.unwrap_or(false) {
@@ -841,7 +1153,43 @@ mod tests {
         };
         let mut out = Vec::new();
         emit_candidates(&config, &mut out).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[35msrc/\x1b[0m\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[35msrc\x1b[0m/\n");
+    }
+
+    #[test]
+    fn colorizes_nested_relative_components_with_candidate_context() {
+        let root = TestRoot::new();
+        let cwd = root.path.join("cwd");
+        let release = cwd.join("github/jasonyukr/historypwd/target/release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("historypwd.bin"), b"").unwrap();
+        let pwdlog = root.path.join("pwdlog");
+        fs::write(
+            &pwdlog,
+            format!(
+                "1\t{}\tvim github/jasonyukr/historypwd/target/release/historypwd.bin\n",
+                cwd.display()
+            ),
+        )
+        .unwrap();
+        let config = Config {
+            kind: Kind::Path,
+            dir: ".".to_string(),
+            leftover: String::new(),
+            display_prefix: ".".to_string(),
+            lines_limit: 5000,
+            max_candidates: 500,
+            pwdlog_file: pwdlog,
+            home: root.path.join("home"),
+            pwd: cwd,
+            ls_colors: Some(LsColors::new(Some("di=35:*.bin=32"))),
+        };
+        let mut out = Vec::new();
+        emit_candidates(&config, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[35mgithub/\x1b[0m\x1b[35mjasonyukr/\x1b[0m\x1b[35mhistorypwd/\x1b[0m\x1b[35mtarget/\x1b[0m\x1b[35mrelease/\x1b[0m\x1b[32mhistorypwd.bin\x1b[0m\n"
+        );
     }
 
     #[test]
@@ -849,8 +1197,8 @@ mod tests {
         let root = TestRoot::new();
         let dir = root.path.join("dir");
         fs::create_dir_all(&dir).unwrap();
-        let colors = LsColors::new(Some("di=35:*.txt=32"));
-        assert_eq!(colors.colorize("dir", &dir, true), "\x1b[35mdir/\x1b[0m");
+        let colors = LsColors::new(Some("di=34;01:*.txt=32"));
+        assert_eq!(colors.colorize("dir", &dir, true), "\x1b[1;34mdir\x1b[0m/");
         let file = root.path.join("file.txt");
         fs::write(&file, b"").unwrap();
         assert_eq!(
@@ -860,6 +1208,29 @@ mod tests {
         assert_eq!(
             colors.colorize("FILE.TXT", &file, false),
             "\x1b[32mFILE.TXT\x1b[0m"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn emits_sticky_other_writable_directory_style_with_directory_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestRoot::new();
+        let dir = root.path.join("shared");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o1777)).unwrap();
+
+        let colors = LsColors::new(Some("tw=30;42:di=35"));
+        assert_eq!(
+            colors.colorize("shared", &dir, true),
+            "\x1b[42;30mshared\x1b[0m/"
+        );
+
+        let fallback_colors = LsColors::new(Some("tw=0:di=35"));
+        assert_eq!(
+            fallback_colors.colorize("shared", &dir, true),
+            "\x1b[35mshared\x1b[0m/"
         );
     }
 
@@ -900,7 +1271,7 @@ mod tests {
         emit_candidates(&config, &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "\x1b[36mlink/\x1b[0m\n\x1b[31mdangling\x1b[0m\n"
+            "\x1b[36mlink\x1b[0m/\n\x1b[31mdangling\x1b[0m\n"
         );
     }
 }
