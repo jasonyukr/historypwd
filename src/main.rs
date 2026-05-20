@@ -309,8 +309,8 @@ impl Config {
         let dir = args.next().unwrap_or_else(|| ".".to_string());
         let leftover = args.next().unwrap_or_default();
         let display_prefix = args.next().unwrap_or_else(|| dir.clone());
-        let lines_limit = env_usize("FZF_HISTORY_COMPLETION_LINES", 5000);
-        let max_candidates = env_usize("FZF_HISTORY_COMPLETION_MAX_CANDIDATES", 500);
+        let lines_limit = env_usize("FZF_HISTORY_COMPLETION_LINES", 3000);
+        let max_candidates = env_usize("FZF_HISTORY_COMPLETION_MAX_CANDIDATES", 3000);
         let pwdlog_file = env::var_os("ZSH_PWD_HISTORY_FILE")
             .map(PathBuf::from)
             .or_else(default_pwdlog_file)
