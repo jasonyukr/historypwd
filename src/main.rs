@@ -663,20 +663,24 @@ fn default_pwdlog_file() -> Option<PathBuf> {
 }
 
 fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
-    let lines = tail_lines(&config.pwdlog_file, config.lines_limit)?;
     let dir_abs = resolve_input_dir(&config.dir, &config.home, &config.pwd);
     let dir_prefix = with_trailing_separator(&dir_abs);
+    let leftover_prefix = (!config.leftover.is_empty()).then(|| {
+        let mut prefix = dir_prefix.clone();
+        prefix.push_str(&config.leftover);
+        prefix
+    });
     let relative_root = !config.dir.starts_with('/') && !config.dir.starts_with('~');
     let mut seen = HashSet::new();
     let mut count = 0usize;
 
-    for line in lines.iter().rev() {
+    for_tail_lines_newest_first(&config.pwdlog_file, config.lines_limit, |line| {
         let Some((logged_cwd, command)) = parse_pwdlog_line(line) else {
-            continue;
+            return Ok(false);
         };
         let logged_cwd = absolutize_existing_or_lexical(Path::new(logged_cwd));
         if logged_cwd.as_os_str().is_empty() || command.is_empty() {
-            continue;
+            return Ok(false);
         }
         let words = scan_tokens(command);
         let post_cwd = infer_post_cwd(&logged_cwd, &words, &config.home);
@@ -699,12 +703,10 @@ fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
             if !compare_string.starts_with(&dir_prefix) {
                 continue;
             }
-            if !config.leftover.is_empty() {
-                let mut leftover_prefix = dir_prefix.clone();
-                leftover_prefix.push_str(&config.leftover);
-                if !compare_string.starts_with(&leftover_prefix) {
-                    continue;
-                }
+            if let Some(leftover_prefix) = &leftover_prefix
+                && !compare_string.starts_with(leftover_prefix)
+            {
+                continue;
             }
             let display = display_path(
                 &compare,
@@ -729,11 +731,15 @@ fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
             };
             writeln!(out, "{output}")?;
             count += 1;
+            if count == 1 {
+                out.flush()?;
+            }
             if count >= config.max_candidates {
-                return Ok(());
+                return Ok(true);
             }
         }
-    }
+        Ok(false)
+    })?;
 
     Ok(())
 }
@@ -746,32 +752,68 @@ fn display_with_dir_marker(display: &str, is_dir: bool) -> String {
     text
 }
 
-fn tail_lines(path: &Path, limit: usize) -> io::Result<Vec<String>> {
+fn for_tail_lines_newest_first(
+    path: &Path,
+    limit: usize,
+    mut handle_line: impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<()> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(());
     }
     let mut file = File::open(path)?;
     let mut pos = file.seek(SeekFrom::End(0))?;
-    let mut buffer = Vec::new();
+    let mut carry = Vec::new();
     let mut chunk = [0u8; 8192];
-    let mut newlines = 0usize;
-    while pos > 0 && newlines <= limit {
+    let mut lines_seen = 0usize;
+    let mut at_file_end = true;
+
+    while pos > 0 && lines_seen < limit {
         let read_len = chunk.len().min(pos as usize);
         pos -= read_len as u64;
         file.seek(SeekFrom::Start(pos))?;
         file.read_exact(&mut chunk[..read_len])?;
-        newlines += chunk[..read_len].iter().filter(|&&b| b == b'\n').count();
-        let mut combined = Vec::with_capacity(read_len + buffer.len());
-        combined.extend_from_slice(&chunk[..read_len]);
-        combined.extend_from_slice(&buffer);
-        buffer = combined;
+
+        let mut data = Vec::with_capacity(read_len + carry.len());
+        data.extend_from_slice(&chunk[..read_len]);
+        data.extend_from_slice(&carry);
+
+        let mut end = data.len();
+        if at_file_end && end > 0 && data[end - 1] == b'\n' {
+            end -= 1;
+        }
+        at_file_end = false;
+
+        while lines_seen < limit {
+            let Some(newline) = data[..end].iter().rposition(|&byte| byte == b'\n') else {
+                break;
+            };
+            if handle_tail_line(&data[newline + 1..end], &mut handle_line)? {
+                return Ok(());
+            }
+            lines_seen += 1;
+            end = newline;
+        }
+
+        carry.clear();
+        carry.extend_from_slice(&data[..end]);
     }
-    let text = String::from_utf8_lossy(&buffer);
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    if lines.len() > limit {
-        lines = lines.split_off(lines.len() - limit);
+
+    if lines_seen < limit && !carry.is_empty() {
+        handle_tail_line(&carry, &mut handle_line)?;
     }
-    Ok(lines)
+
+    Ok(())
+}
+
+fn handle_tail_line(
+    bytes: &[u8],
+    handle_line: &mut impl FnMut(&str) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    match String::from_utf8_lossy(bytes) {
+        std::borrow::Cow::Borrowed(line) => handle_line(line),
+        std::borrow::Cow::Owned(line) => handle_line(&line),
+    }
 }
 
 fn parse_pwdlog_line(line: &str) -> Option<(&str, &str)> {
@@ -1060,6 +1102,46 @@ mod tests {
         );
         assert_eq!(infer_post_cwd(&cwd, &scan_tokens("pushd +1"), &home), None);
         assert_eq!(infer_post_cwd(&cwd, &scan_tokens("cd"), &home), Some(home));
+    }
+
+    #[test]
+    fn visits_tail_lines_newest_first_and_respects_limit() {
+        let root = TestRoot::new();
+        let pwdlog = root.path.join("pwdlog");
+        fs::write(&pwdlog, "one\ntwo\nthree\nfour\n").unwrap();
+
+        let mut lines = Vec::new();
+        for_tail_lines_newest_first(&pwdlog, 3, |line| {
+            lines.push(line.to_string());
+            Ok(false)
+        })
+        .unwrap();
+
+        assert_eq!(lines, vec!["four", "three", "two"]);
+    }
+
+    #[test]
+    fn visits_tail_lines_across_chunks_and_stops_early() {
+        let root = TestRoot::new();
+        let pwdlog = root.path.join("pwdlog");
+        let long = "x".repeat(9000);
+        fs::write(
+            &pwdlog,
+            format!("old\n{long}\nnewest-without-trailing-newline"),
+        )
+        .unwrap();
+
+        let mut lines = Vec::new();
+        for_tail_lines_newest_first(&pwdlog, 10, |line| {
+            lines.push(line.to_string());
+            Ok(lines.len() == 2)
+        })
+        .unwrap();
+
+        assert_eq!(
+            lines,
+            vec!["newest-without-trailing-newline".to_string(), long]
+        );
     }
 
     #[test]
