@@ -712,8 +712,9 @@ fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
             if !compare_string.starts_with(&dir_prefix) {
                 return Ok(false);
             }
-            if let Some(leftover_prefix) = &leftover_prefix
-                && !compare_string.starts_with(leftover_prefix)
+            if leftover_prefix
+                .as_ref()
+                .is_some_and(|leftover_prefix| !compare_string.starts_with(leftover_prefix))
             {
                 return Ok(false);
             }
