@@ -373,7 +373,11 @@ struct DisplayComponent {
 
 fn append_styled_component(output: &mut String, text: &str, style: Option<&str>) {
     if let Some(style) = style {
-        output.push_str(&format!("\x1b[{style}m{text}\x1b[0m"));
+        output.push_str("\x1b[");
+        output.push_str(style);
+        output.push('m');
+        output.push_str(text);
+        output.push_str("\x1b[0m");
     } else {
         output.push_str(text);
     }
@@ -672,41 +676,46 @@ fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
     });
     let relative_root = !config.dir.starts_with('/') && !config.dir.starts_with('~');
     let mut seen = HashSet::new();
+    let mut last_logged_cwd: Option<(String, PathBuf)> = None;
     let mut count = 0usize;
 
     for_tail_lines_newest_first(&config.pwdlog_file, config.lines_limit, |line| {
         let Some((logged_cwd, command)) = parse_pwdlog_line(line) else {
             return Ok(false);
         };
-        let logged_cwd = absolutize_existing_or_lexical(Path::new(logged_cwd));
-        if logged_cwd.as_os_str().is_empty() || command.is_empty() {
+        if logged_cwd.is_empty() || command.is_empty() {
             return Ok(false);
         }
-        let words = scan_tokens(command);
-        let post_cwd = infer_post_cwd(&logged_cwd, &words, &config.home);
-        for word in words {
-            if should_skip_word(&word) {
-                continue;
+        let logged_cwd = match &last_logged_cwd {
+            Some((raw, path)) if raw == logged_cwd => path.clone(),
+            _ => {
+                let path = absolutize_existing_or_lexical(Path::new(logged_cwd));
+                last_logged_cwd = Some((logged_cwd.to_string(), path.clone()));
+                path
             }
-            let Some(expanded) = expand_tilde(&word, &config.home) else {
-                continue;
+        };
+        let mut emit_word = |word: &str, post_cwd: Option<&Path>| -> io::Result<bool> {
+            if should_skip_word(word) {
+                return Ok(false);
+            }
+            let Some(expanded) = expand_tilde(word, &config.home) else {
+                return Ok(false);
             };
-            let Some(candidate) = resolve_candidate(&expanded, &logged_cwd, post_cwd.as_deref())
-            else {
-                continue;
+            let Some(candidate) = resolve_candidate(&expanded, &logged_cwd, post_cwd) else {
+                return Ok(false);
             };
             if config.kind == Kind::Dir && !candidate.is_dir {
-                continue;
+                return Ok(false);
             }
             let compare = candidate.path.as_path();
             let compare_string = path_string(&compare);
             if !compare_string.starts_with(&dir_prefix) {
-                continue;
+                return Ok(false);
             }
             if let Some(leftover_prefix) = &leftover_prefix
                 && !compare_string.starts_with(leftover_prefix)
             {
-                continue;
+                return Ok(false);
             }
             let display = display_path(
                 &compare,
@@ -716,7 +725,7 @@ fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
                 relative_root,
             );
             if !seen.insert(display.clone()) {
-                continue;
+                return Ok(false);
             }
             let output = if let Some(ls_colors) = &config.ls_colors {
                 ls_colors.colorize_with_metadata(
@@ -734,8 +743,30 @@ fn emit_candidates(config: &Config, out: &mut dyn Write) -> io::Result<()> {
             if count == 1 {
                 out.flush()?;
             }
-            if count >= config.max_candidates {
+            Ok(count >= config.max_candidates)
+        };
+
+        let mut words = TokenScanner::new(command);
+        let Some(first_word) = words.next() else {
+            return Ok(false);
+        };
+
+        if first_word == "cd" || first_word == "pushd" {
+            let words = std::iter::once(first_word).chain(words).collect::<Vec<_>>();
+            let post_cwd = infer_post_cwd(&logged_cwd, &words, &config.home);
+            for word in &words {
+                if emit_word(word, post_cwd.as_deref())? {
+                    return Ok(true);
+                }
+            }
+        } else {
+            if emit_word(&first_word, None)? {
                 return Ok(true);
+            }
+            for word in words {
+                if emit_word(&word, None)? {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
@@ -822,56 +853,87 @@ fn parse_pwdlog_line(line: &str) -> Option<(&str, &str)> {
     Some((logged_cwd, command))
 }
 
-fn scan_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut single = false;
-    let mut double = false;
-    while let Some(ch) = chars.next() {
-        if single {
-            if ch == '\'' {
-                single = false;
-            } else {
-                current.push(ch);
-            }
-            continue;
+struct TokenScanner<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    current: String,
+    single: bool,
+    double: bool,
+    finished: bool,
+}
+
+impl<'a> TokenScanner<'a> {
+    fn new(command: &'a str) -> Self {
+        Self {
+            chars: command.chars().peekable(),
+            current: String::new(),
+            single: false,
+            double: false,
+            finished: false,
         }
-        if double {
+    }
+}
+
+impl Iterator for TokenScanner<'_> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        loop {
+            let Some(ch) = self.chars.next() else {
+                self.finished = true;
+                return (!self.current.is_empty()).then(|| std::mem::take(&mut self.current));
+            };
+
+            if self.single {
+                if ch == '\'' {
+                    self.single = false;
+                } else {
+                    self.current.push(ch);
+                }
+                continue;
+            }
+
+            if self.double {
+                match ch {
+                    '"' => self.double = false,
+                    '\\' => {
+                        if let Some(next) = self.chars.next() {
+                            self.current.push(next);
+                        }
+                    }
+                    _ => self.current.push(ch),
+                }
+                continue;
+            }
+
             match ch {
-                '"' => double = false,
+                '\'' => self.single = true,
+                '"' => self.double = true,
                 '\\' => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
+                    if let Some(next) = self.chars.next() {
+                        self.current.push(next);
                     }
                 }
-                _ => current.push(ch),
-            }
-            continue;
-        }
-        match ch {
-            '\'' => single = true,
-            '"' => double = true,
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    current.push(next);
+                ' ' | '\t' | '\n' | '\r' | ';' | '|' | '&' => {
+                    if (ch == '&' || ch == '|') && self.chars.peek() == Some(&ch) {
+                        self.chars.next();
+                    }
+                    if !self.current.is_empty() {
+                        return Some(std::mem::take(&mut self.current));
+                    }
                 }
+                _ => self.current.push(ch),
             }
-            ' ' | '\t' | '\n' | '\r' | ';' | '|' | '&' => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                if (ch == '&' || ch == '|') && chars.peek() == Some(&ch) {
-                    chars.next();
-                }
-            }
-            _ => current.push(ch),
         }
     }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+}
+
+#[cfg(test)]
+fn scan_tokens(command: &str) -> Vec<String> {
+    TokenScanner::new(command).collect()
 }
 
 fn should_skip_word(word: &str) -> bool {
